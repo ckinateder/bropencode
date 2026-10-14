@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Run opencode in the container against the directory you're standing in.
+#
+#   oc-here                    mount $PWD as /workspace
+#   oc-here --root ~/code      mount ~/code, start in the subdir matching $PWD
+#   oc-here --shell            bash instead of opencode (combine with --root)
+#   oc-here -h, --help         show this help
+#   oc-here [opencode args...] anything else is passed to opencode
+set -euo pipefail
+
+compose_file="$(dirname "$(readlink -f "$0")")/compose.yaml"
+root="$PWD"
+entrypoint=()
+
+usage() {
+    cat <<'EOF'
+Usage: oc-here [options] [opencode args...]
+
+Run the opencode coding agent in a hardened Docker container against the current directory.
+
+What the container does:
+  - Mounts only your project (default $PWD) at /workspace; nothing else of yours is visible.
+  - Runs as your uid/gid with a read-only root fs, no capabilities and pid/memory limits.
+  - Talks to the one model endpoint in .env (MODEL_BASE_URL, MODEL, MODEL_API_KEY).
+  - Sends all network traffic through a Squid proxy sidecar that allows only that
+    endpoint plus ALLOWED_DOMAINS from .env (set it to * to allow everything).
+  - Disables web search, asks before every web fetch, and turns off update checks,
+    the model catalog download, session sharing and LSP servers.
+
+Options (must come before any opencode args):
+  --root DIR   mount DIR instead of $PWD; start in the subdir matching $PWD
+  --shell      bash instead of opencode
+  -h, --help   show this help
+
+Parsing stops at the first unknown argument; it and everything after goes to opencode,
+so `oc-here run -h` shows opencode's help, not this one.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --root)  root="$(readlink -f "${2:?--root needs a directory}")"; shift 2 ;;
+        --shell) entrypoint=(--entrypoint bash); shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) break ;;
+    esac
+done
+
+# Mounting these would expose far more than a project (ssh keys, everything).
+if [[ "$root" == "/" || "$root" == "$HOME" ]]; then
+    echo "error: refusing to mount '$root'; pick a project dir or a subdir of it" >&2
+    exit 1
+fi
+case "$PWD/" in
+    "$root"/*) ;;
+    *) echo "error: current dir '$PWD' is not inside --root '$root'" >&2; exit 1 ;;
+esac
+
+if [[ $EUID -eq 0 ]]; then echo "error: don't run oc-here as root" >&2; exit 1; fi
+
+workdir="/workspace${PWD#"$root"}"
+export HOST_UID="$(id -u)" HOST_GID="$(id -g)" PROJECT_DIR="$root"
+compose=(docker compose -f "$compose_file")
+
+# Recreates the proxy if MODEL_BASE_URL/ALLOWED_DOMAINS changed since it started
+"${compose[@]}" up -d --wait proxy
+
+exec "${compose[@]}" run --rm -w "$workdir" "${entrypoint[@]}" opencode "$@"

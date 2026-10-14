@@ -1,0 +1,69 @@
+# `opencode` only reaches the network through the allowlist proxy
+# `proxy`    Squid sidecar; allows MODEL_BASE_URL's host plus ALLOWED_DOMAINS (.env);
+#            ALLOWED_DOMAINS=* allows everything
+
+services:
+  opencode:
+    build: .
+    image: bropencode:latest
+    env_file: .env
+    environment:
+      HTTP_PROXY: http://proxy:3128
+      HTTPS_PROXY: http://proxy:3128
+      # opencode talks to its own local server over loopback
+      NO_PROXY: localhost,127.0.0.1,::1
+      # Node's fetch ignores the proxy vars without this
+      NODE_USE_ENV_PROXY: "1"
+    # oc-here sets HOST_UID/HOST_GID so files in /workspace are owned by you
+    user: "${HOST_UID:-10001}:${HOST_GID:-10001}"
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    volumes:
+      # Only the project you want the agent to touch (override with PROJECT_DIR)
+      - ${PROJECT_DIR:-./workspace}:/workspace
+      # Sessions persist here
+      - opencode-data:/data
+    read_only: true
+    tmpfs:
+      # exec: the TUI unpacks its native render library here and loads it
+      - /tmp:size=512m,mode=1777,exec
+      # Rest of HOME (rendered config, caches); ephemeral
+      - /home/opencode:size=128m,uid=${HOST_UID:-10001},gid=${HOST_GID:-10001},mode=0700
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    mem_limit: 2g
+    networks: [internal]
+    depends_on:
+      proxy:
+        condition: service_healthy
+
+  proxy:
+    build: ./proxy
+    image: bropencode-proxy:latest
+    env_file: .env
+    networks: [internal, egress]
+    extra_hosts:
+      # Lets the proxy reach a model server running on the Docker host (Linux)
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/3128"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 256m
+
+networks:
+  # No route out; the proxy is the only way off it
+  internal:
+    internal: true
+  egress:
+
+volumes:
+  opencode-data:
